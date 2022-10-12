@@ -1,0 +1,362 @@
+# This is a project that I worked on as the Business intelligence Intern for FC Cincinnati. I used past attendance data to create a 
+# model to predict the scan/attendance rate for future games.
+
+
+#Scan Rate Modeling - With Updated 2022 Usage
+
+setwd("~/Documents")
+pacman::p_load(readxl,ggplot2,lubridate,nortest,MASS,car, stats, stringr,boot,tidyverse,finalfit, caret,hydroTSM, forecast)
+
+##################### Importing Data ##################### 
+
+## Import 2021 data set
+
+attendance2021 <- read_excel("ticket_usage_21.xlsx") %>%
+  mutate(
+    game_tier = if_else(str_detect(event_name, 'XYZ|XYZ2'), 'A',
+                        if_else(str_detect(event_name, 'XYZ3|XYZ4'), 'B',
+                                if_else(str_detect(event_name, 'XYZ5|XYZ6'), 'C', 'D')))
+    , srs_id = paste(section, row, seat, sep='-')
+    , A_B_game = if_else(game_tier %in% c('A','B'), 1,0)
+    , C_D_game = if_else(game_tier %in% c('C','D') ,1,0)
+    , scanned = ifelse(is_scanned == c("Yes"), 1,0)
+    , event_date=as.Date(event_date, format="%m/%d/%Y")
+    , season=time2season(as.Date(event_date), out.fmt = "seasons")
+    , dayofweek=factor(wday(event_date, label=TRUE),ordered = FALSE)
+    , is_resale=ifelse(Email == TikOwnerEmail, 0, 1)
+    , game=as.numeric(factor(event_date))
+    ) %>% 
+  filter(price_group !='Comp Group',
+         !is.na(is_resale)) %>%
+  group_by(event_date,StandDescr) %>% 
+  mutate(scan_rate_stand = sum(scanned)/length(TicketNumber)
+         , tickets_sold = length(TicketNumber)
+         , tickets_scanned = sum(scanned)) %>% 
+  rename(price_level=price_lvel) %>% 
+  ungroup() %>% 
+  dplyr::select(event_date,event_name, game_tier, scanned, game, scan_rate_stand, StandDescr,is_resale,dayofweek,season,price_group ,A_B_game, C_D_game, tickets_sold, tickets_scanned )
+
+
+## Import 2022
+
+attendance2022<-rio::import('TU_all_22.csv')%>%
+  mutate(game_tier = if_else(str_detect(event_name, 'XYZ'), 'A',
+                             if_else(str_detect(event_name, 'XYZ1|XYZ2'), 'B',
+                                     if_else(str_detect(event_name, 'XYZ3|XYZ4'), 'C', 'D')))
+         , srs_id = paste(section, row, seat, sep='-')
+         , event_name  = str_squish(str_sub(event_name, start=1L, end = 9L))
+         , A_B_game = if_else(game_tier %in% c('A','B'), 1,0)
+         , C_D_game = if_else(game_tier %in% c('C','D') ,1,0)
+         , event_date=as.Date(event_date, format="%m/%d/%Y")
+         , season=time2season(as.Date(event_date), out.fmt = "seasons")
+         , dayofweek=factor(wday(event_date, label=TRUE),ordered=FALSE)
+         , is_resale=ifelse(Email == TikOwnerEmail, 0, 1)
+         , game=as.numeric(factor(event_date))
+         ) %>%
+  filter(price_group !='Test Tickets'
+         , !is.na(is_resale)) %>%
+  group_by(event_date,StandDescr) %>% 
+  mutate(scan_rate_stand = sum(scanned)/length(srs_id)
+         , tickets_sold = length(srs_id)
+         , tickets_scanned = sum(scanned)) %>% 
+  mutate(scan_rate_stand = replace(scan_rate_stand, scan_rate_stand==0, 1.00)) %>%
+  dplyr::select(event_date,event_name, scanned, game, game_tier, scan_rate_stand, StandDescr,is_resale,dayofweek,season,price_group ,A_B_game, C_D_game, tickets_sold, tickets_scanned )
+
+## Combine 2021 and 2022
+attendance_full<- attendance2021 %>% 
+  bind_rows(attendance2022) %>% 
+  group_by(game_tier, StandDescr) %>% 
+  mutate(avg_tik_sold = mean(tickets_sold)
+         ,avg_tik_scanned = mean(tickets_scanned)) %>% 
+  mutate(tickets_scanned = replace(tickets_scanned, tickets_scanned==0, 100))
+  
+## Create train and test data sets
+set.seed(123)
+split_data<-sample(c(rep(0,0.8*nrow(attendance_full)), rep(1,0.2*nrow(attendance_full))))
+train_data<-attendance_full[split_data==0,]
+test_data<-attendance_full[split_data==1,]
+
+# ## Descriptive Stats of Average # of Tickets Sold Per Stand Throughout 2021 and 2022
+# average_tickets_sold<-attendance_full %>%  
+#   group_by(game_tier, StandDescr) %>% 
+#   summarise(avg_tik_sold = mean(avg_tik_sold))
+
+## Create Data Frame for Remaining 2022 Season
+predictions2022<-as.data.frame(c("YYYY-MM-DD", "YYYY-MM-DD"))
+colnames(predictions2022)<-c("event_date")
+predictions2022<- predictions2022 %>% 
+  right_join(data.frame(event_date = c("YYYY-MM-DD", "YYYY-MM-DD"),
+                        event_name = c("XYZ","XYZ1")
+  ), by="event_date") %>% 
+  mutate(game=(1:n())+11
+         , season=time2season(as.Date(event_date), out.fmt = "seasons")
+         , dayofweek=wday(event_date, label=TRUE)
+         , game_tier = if_else(str_detect(event_date, 'YYYY-MM-DD'), 'A', 
+                               if_else(str_detect(event_date, 'YYYY-MM-DD'), 'B',
+                                       if_else(str_detect(event_date, 'YYYY-MM-DD'), 'C', 'D')))
+         , A_B_game = if_else(game_tier %in% c('A','B'), 1,0)
+         , C_D_game = if_else(game_tier %in% c('C','D') ,1,0)
+         ) %>% 
+  slice(rep(1:n(), each=154)) %>% 
+  cbind(na.omit(expand(attendance2021, StandDescr, is_resale, price_group)))
+
+
+
+
+
+##################### Regression Model with Box Cox Transformation #####################
+
+## Box Plot for Scan Rate 
+dev.off()
+boxplot(attendance_full$scan_rate_stand, main="Scan Rate Boxplot", ylab=c("Scan Rate"))
+#a few outliers in the data
+
+## Check Normality of Scan Rate by Stand
+hist(attendance_full$scan_rate_stand, xlab="Scan Rate by Stand", main="Histogram of Scan Rate by Stand")
+
+qqnorm(attendance_full$scan_rate_stand, pch=1)
+qqline(attendance_full$scan_rate_stand, col="red")
+
+ad.test(attendance_full$scan_rate_stand)
+
+#AD test indicates the scan rate is not normally distributed, so box cox transformation performed
+
+bc_model1<-boxcox(scan_rate_stand~StandDescr+factor(is_resale)+dayofweek+season+price_group
+                            +factor(A_B_game)
+                            +factor(A_B_game):StandDescr
+                            ,data=train_data)
+lambda <- bc_model1$x[which.max(bc_model1$y)]
+model1<-lm(((scan_rate_stand^lambda-1)/lambda)~StandDescr+factor(is_resale)+dayofweek+season+price_group 
+                           +factor(A_B_game)
+                           +factor(A_B_game):StandDescr
+                           ,data=train_data)
+summary(model1)
+anova(model1)
+par(mfrow=c(2,2))
+plot(model1)
+
+
+## Predict with Test Data
+test_data$model1_pred<-(lambda*predict(model1, newdata = test_data)+1)^(1/lambda)
+
+## Accuracy of Model on Test Data
+accuracy(test_data$scan_rate_stand, test_data$model1_pred)
+
+## Create Predictions
+attendance_full$model1_pred<-(lambda*predict(model1, newdata = attendance_full)+1)^(1/lambda)
+attendance2021$model1_pred<-(lambda*predict(model1, newdata= attendance2021)+1)^(1/lambda)
+attendance2022$model1_pred<-(lambda*predict(model1, newdata = attendance2022)+1)^(1/lambda)
+predictions2022$model1_pred<-(lambda*predict(model1, newdata = predictions2022)+1)^(1/lambda)
+
+## Plotting 2021 Predicted vs. Actual
+dev.off()
+plot(scan_rate_stand~game, data=attendance2021, ylim=c(0,1), main="2021 Predicted vs. Actual Scan Rate by Stand", ylab="Scan Rate", xlab="Game", col="red")
+points(model1_pred~game,data=attendance2021 , pch=1, col='black')
+legend(1,.25,legend=c("Predicted - Box Cox Model", "Actual"), col=c("black","red"), pch=c(1,1))
+
+## 2021 Accuracy
+accuracy(attendance2021$scan_rate_stand, attendance2021$model1_pred)
+
+## Plotting 2022 Predicted vs. Actual
+plot(scan_rate_stand~game, data=attendance2022, ylim=c(0,1), main="2021 Predicted vs. Actual Scan Rate by Stand", ylab="Scan Rate", xlab="Game", col="red")
+points(model1_pred~game,data=attendance2022 , pch=1, col='black')
+legend(1,.25,legend=c("Predicted - Box Cox Model","Actual"), col=c("black","red"), pch=c(1,1))
+
+## 2022 Accuracy
+accuracy(attendance2022$scan_rate_stand, attendance2022$model1_pred)
+
+## Full 2022 Season Predicted vs. Actual
+plot(scan_rate_stand~game,data=attendance2022, ylim=c(0,1),xlim=c(0,18), main="2022 Rest of Season Predictions", ylab="Scan Rate", xlab="Game", col="red")
+points(model1_pred~game, data=attendance2022, pch=1, col='black')
+points(model1_pred~game, predictions2022, pch=1, col='black')
+legend(1,.25,legend=c("Predicted - Box Cox Model", "Actual" ), col=c('black','red'), pch=c(1,1))
+
+##################### Bootstrap Model #####################
+
+boot_model<-train(scan_rate_stand~StandDescr+factor(is_resale)+dayofweek+season+price_group 
+                  +factor(A_B_game)
+                  +factor(A_B_game):StandDescr, data=train_data, method='lm', trControl=trainControl(method="boot", number=1000))
+boot_model
+summary(boot_model)
+boot_fit<-boot_model$finalModel
+
+## Predict with Test Data
+test_data$boot_pred<-predict(boot_model, newdata = test_data)
+
+## Accuracy of Model on Test Data
+accuracy(test_data$scan_rate_stand, test_data$boot_pred)
+
+## Create Predictions 
+attendance_full$boot_pred<-predict(boot_model, newdata=attendance_full)
+attendance2021$boot_pred<-predict(boot_model, newdata= attendance2021)
+attendance2022$boot_pred<-predict(boot_model, newdata = attendance2022)
+predictions2022$boot_pred<-predict(boot_model, newdata = predictions2022)
+
+
+## Plotting 2021 Predicted vs. Actual
+plot(scan_rate_stand~game, data=attendance2021, ylim=c(0,1), main="2021 Predicted vs. Actual Scan Rate by Stand", ylab="Scan Rate", xlab="Game", col="red")
+points(boot_pred~game,data=attendance2021 , pch=1, col='blue')
+legend(1,.25,legend=c("Predicted - Bootstrap", "Actual"), col=c("blue","red"), pch=c(1,1))
+
+## 2021 Accuracy 
+accuracy(attendance2021$scan_rate_stand, attendance2021$boot_pred)
+
+## Plotting 2022 Predicted vs. Actual
+plot(scan_rate_stand~game, data=attendance2022, ylim=c(0,1), main="2022 Predicted vs. Actual Scan Rate by Stand", ylab="Scan Rate", xlab="Game", col="red")
+points(boot_pred~game,data=attendance2022 , pch=1, col='blue')
+legend(1,.25,legend=c("Predicted - Bootstrap","Actual"), col=c("blue","red"), pch=c(1,1))
+
+## 2022 Accuracy
+accuracy(attendance2022$scan_rate_stand, attendance2022$boot_pred)
+
+## Full 2022 Season Predicted vs. Actual
+plot(scan_rate_stand~game,data=attendance2022, ylim=c(0,1),xlim=c(0,18), main="2022 Rest of Season Predictions", ylab="Scan Rate", xlab="Game", col="red")
+points(boot_pred~game, data=attendance2022, pch=1, col='blue')
+points(boot_pred~game, predictions2022, pch=1, col='blue')
+legend(1,.25,legend=c("Predicted - Bootstrap", "Actual" ), col=c('blue','red'), pch=c(1,1))
+
+## Mean Scan Rate and Predicted Scan Rates By Stand and Event
+
+## 2021 and 2022
+attendance_full_means<- attendance_full %>% 
+  group_by(event_name, StandDescr,game) %>% 
+  summarise(mean_scan_rate = mean(scan_rate_stand)
+            ,mean_model1_pred = mean(model1_pred)
+            ,mean_boot_pred = mean(boot_pred))
+## 2021
+attendance2021_means<- attendance2021 %>% 
+  group_by(event_name, StandDescr,game) %>% 
+  summarise(mean_scan_rate = mean(scan_rate_stand)
+            ,mean_model1_pred = mean(model1_pred)
+            ,mean_boot_pred = mean(boot_pred))
+## 2022
+attendance2022_means<- attendance2022 %>% 
+  group_by(event_name, StandDescr, game) %>% 
+  summarise(mean_scan_rate = mean(scan_rate_stand)
+            ,mean_model1_pred = mean(model1_pred)
+            ,mean_boot_pred = mean(boot_pred))
+## 2022 Rest of Season
+predictions2022_means<-predictions2022 %>% 
+  group_by(event_name, StandDescr, game) %>% 
+  summarise(mean_model1_pred = mean(model1_pred)
+            ,mean_boot_pred = mean(boot_pred))
+
+##################### Comparing Models #####################
+
+## Summaries of Models
+summary(model1)
+summary(boot_model)
+#Very close R-sq and adj-R-sq, model 1 has slightly higher r-sq values, but not significantly higher
+
+## Accuracy of Models on Test Data
+accuracy(test_data$scan_rate_stand, test_data$model1_pred)
+accuracy(test_data$scan_rate_stand, test_data$boot_pred)
+#extremely similar, no significant difference except ME
+
+## Accuracy on Full Data Set
+accuracy(attendance_full$scan_rate_stand, attendance_full$model1_pred)
+accuracy(attendance_full$scan_rate_stand, attendance_full$boot_pred)
+#no significant difference except ME
+
+##Comparing Box Cox to Bootstrap for 2021 Predictions (Means)
+par(mfrow=c(1,2))
+
+## Box Cox Model
+plot(mean_scan_rate~game, data=attendance2021_means, pch=1, col='red', xlim=c(0,18), ylim=c(0.4,1), xlab='Game', ylab='Mean Scan Rate Per Stand', main= "Box Cox Model")
+points(mean_model1_pred~game, data=attendance2021_means, pch=1, col='black')
+legend(0,.45,legend=c("Actual Scan Rate","Predicted Scan Rate - BoxCox Model" ), col=c('red','black'), pch=c(1,1), cex=.75)
+
+## Bootstrap Model
+plot(mean_scan_rate~game, data=attendance2021_means, pch=1, col='red', xlim=c(0,18), ylim=c(0.4,1), xlab='Game', ylab='Mean Scan Rate Per Stand', main= "Bootstrap Model")
+points(mean_boot_pred~game, data=attendance2021_means, pch=1, col='blue')
+legend(0,.45,legend=c("Actual Scan Rate","Predicted Scan Rate - Bootstrap" ), col=c('red','blue'), pch=c(1,1), cex=.75)
+
+
+##Comparing Box Cox to Bootstrap for 2022 Predictions (Means)
+
+## Box Cox Model
+plot(mean_scan_rate~game, data=attendance2022_means, pch=1, col='red', xlim=c(0,18), ylim=c(0.4,1), xlab='Game', ylab='Mean Scan Rate Per Stand', main = "Box Cox Model")
+points(mean_model1_pred~game, data=attendance2022_means, pch=1, col='black')
+points(mean_model1_pred~game, data=predictions2022_means, pch=1, col='black')
+legend(0,.45, legend=c("Actual Scan Rate","Predicted Scan Rate - BoxCox Model" ), col=c('red','black'), pch=c(1,1), cex=.75)
+
+## Bootstrap Model
+plot(mean_scan_rate~game, data=attendance2022_means, pch=1, col='red', xlim=c(0,18), ylim=c(0.4,1), xlab='Game', ylab='Mean Scan Rate Per Stand', main= "Bootstrap Model")
+points(mean_boot_pred~game, data=attendance2022_means, pch=1, col='blue')
+points(mean_boot_pred~game, data=predictions2022_means, pch=1, col='blue')
+legend(0,.45,legend=c("Actual Scan Rate","Predicted Scan Rate - Bootstrap" ), col=c('red','blue'), pch=c(1,1), cex=.75)
+
+
+
+
+##################### Tickets Sold - Box Cox ##################### 
+
+boxplot(attendance_full$tickets_sold, main = "Tickets Sold Boxplot", ylab=c("# of Tickets Sold"))
+hist(attendance_full$tickets_sold, xlab="# of Tickets Sold", main="Histogram of Tickets Sold by Stand")
+
+qqnorm(attendance_full$tickets_sold, pch=1)
+qqline(attendance_full$tickets_sold, col='red')
+
+ad.test(attendance_full$tickets_sold)
+# tickets sold is not normally dist., so will perform box cox transformation
+
+bc_model_tik_sold<-boxcox(tickets_sold~StandDescr+factor(is_resale)+dayofweek+season+price_group
+                  +factor(A_B_game)
+                  +factor(A_B_game):StandDescr
+                  ,data=train_data)
+lambda2 <- bc_model_tik_sold$x[which.max(bc_model_tik_sold$y)]
+model_tik_sold<-lm(((tickets_sold^lambda2-1)/lambda2)~StandDescr+factor(is_resale)+dayofweek+season+price_group 
+           +factor(A_B_game)
+           +factor(A_B_game):StandDescr
+           ,data=train_data)
+
+summary(model_tik_sold)
+anova(model_tik_sold)
+stepAIC(model_tik_sold)
+#No predictors removed
+
+par(mfrow = c(2,2))
+plot(model_tik_sold)
+
+
+## Predicting on Test Data
+test_data$tik_sold_pred<-(lambda2*predict(model_tik_sold, newdata = test_data)+1)^(1/lambda2)
+accuracy(test_data$tickets_sold, test_data$tik_sold_pred)
+
+## Create Predictions
+attendance_full$tik_sold_pred<-(lambda2*predict(model_tik_sold, newdata = attendance_full)+1)^(1/lambda2)
+attendance2021$tik_sold_pred<-(lambda2*predict(model_tik_sold, newdata = attendance2021)+1)^(1/lambda2)
+attendance2022$tik_sold_pred<-(lambda2*predict(model_tik_sold, newdata = attendance2022)+1)^(1/lambda2)
+predictions2022$tik_sold_pred<-(lambda2*predict(model_tik_sold, newdata = predictions2022)+1)^(1/lambda2)
+
+## 2021 Accuracy
+accuracy(attendance2021$tickets_sold, attendance2021$tik_sold_pred)
+
+## 2022 Accuracy
+accuracy(attendance2022$tickets_sold, attendance2022$tik_sold_pred)
+
+
+
+##### Final Predictions #####
+scan_rate_2022_predictions <-predictions2022 %>% 
+  dplyr::select(event_name,game_tier,StandDescr, boot_pred, tik_sold_pred, tik_scanned_pred) %>% 
+  group_by(event_name,game_tier,StandDescr) %>% 
+  summarise(mean_pred_scan_rate = mean(boot_pred)
+            , median_pred_scan_rate = median(boot_pred)
+            , mean_pred_tickets_sold = mean(tik_sold_pred)
+            , median_pred_tickets_sold = median(tik_sold_pred)
+            , mean_pred_tickets_scanned = mean_pred_scan_rate*mean_pred_tickets_sold
+            , median_pred_tickets_scanned = median_pred_scan_rate*median_pred_tickets_sold
+            ) 
+
+scan_rate_2022_predictions_sums<-scan_rate_2022_predictions %>% 
+  group_by(event_name, game_tier) %>% 
+  summarise(overall_pred_scan_rate = sum(mean_pred_scan_rate * (mean_pred_tickets_sold/sum(mean_pred_tickets_sold)))
+            , total_pred_tickets_sold = sum(mean_pred_tickets_sold)
+            , total_pred_tickets_scanned = sum(mean_pred_tickets_scanned)
+            )
+
+write.csv(scan_rate_2022_predictions, "2022 Scan Rate Predictions.csv")
+write.csv(scan_rate_2022_predictions_sums, "2022 Scan Rate Predictions by Game.csv")
+
+
